@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"sync"
+	"time"
 )
 
 const (
@@ -15,74 +17,166 @@ const (
 	dep_failed
 )
 
-type Actor struct {
-	sync.Mutex
-	name    string
-	status  int
-	startFn func() error
-	deps    []*Actor
+type status int
+
+func (s status) String() string {
+	switch s {
+	case idle:
+		return "idle"
+	case starting:
+		return "starting"
+	case running:
+		return "running"
+	case stopping:
+		return "stopping"
+	case stopped:
+		return "stopped"
+	case failed:
+		return "failed"
+	case dep_failed:
+		return "dependency failed"
+	default:
+		return "unknown"
+	}
 }
 
-func (a *Actor) Start(timeout int) error {
-	var err error
+type Actor struct {
+	sync.Mutex
+	once     sync.Once
+	startErr error
+
+	name   string
+	status status
+
+	startFn func() error
+	timeout int
+
+	deps []*Actor
+}
+
+type result struct {
+	err error
+}
+
+func (a *Actor) Start() error {
+	a.once.Do(func() {
+		a.startErr = a.start()
+	})
+	return a.startErr
+}
+
+func (a *Actor) start() error {
+	// Start all dependencies concurrently
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
 	for _, dep := range a.deps {
-		if err != nil {
-			log.Printf("%s: skippoing dependency actor (%s): %s", a.name, dep.name, err)
-			break
-		}
-		func() {
-			dep.Lock()
-			defer dep.Unlock()
-			if dep.status == idle {
-				log.Printf("%s: starting dependency actor (%s)", a.name, dep.name)
-				if err = dep.Start(timeout); err != nil {
-					a.status = dep_failed
-					log.Printf("%s: failed to start dependency actor (%s): %v", a.name, dep.name, err)
-					return
-				}
-			} else {
-				log.Printf("%s: dependency actor already in status (%s): %d", a.name, dep.name, dep.status)
+		wg.Go(func() {
+			if err := dep.Start(); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
 			}
-		}()
+		})
 	}
-	if a.status == dep_failed {
-		return err
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		a.Lock()
+		a.status = dep_failed
+		a.Unlock()
+		return errs[0]
 	}
-	if err := a.startFn(); err != nil {
+
+	// Start self
+	var err error
+	if a.timeout == 0 {
+		err = a.startFn()
+		if err != nil {
+			a.Lock()
+			a.status = failed
+			a.Unlock()
+			return err
+		}
+		a.Lock()
+		a.status = running
+		a.Unlock()
+		log.Printf("%s: started", a.name)
+		return nil
+	}
+
+	c := make(chan result, 1)
+	go func() {
+		c <- result{a.startFn()}
+	}()
+
+	select {
+	case res := <-c:
+		if res.err != nil {
+			a.Lock()
+			a.status = failed
+			a.Unlock()
+			return res.err
+		}
+	case <-time.After(time.Duration(a.timeout) * time.Millisecond):
+		a.Lock()
 		a.status = failed
-		return err
+		a.Unlock()
+		return errors.New("timeout")
 	}
+
+	a.Lock()
 	a.status = running
+	a.Unlock()
+	log.Printf("%s: started", a.name)
 	return nil
 }
 
 func main() {
-
 	net := &Actor{
-		name: "network",
+		timeout: 60,
+		name:    "network",
 		startFn: func() error {
-			return nil //errors.New("network error")
+			return errors.New("network error")
 		},
 	}
 
 	db := &Actor{
-		name: "Database",
+		timeout: 100,
+		name:    "database",
 		startFn: func() error {
-			log.Println("DB is running")
+			return errors.New("port busy")
+		},
+		deps: []*Actor{net},
+	}
+
+	cache := &Actor{
+		timeout: 100,
+		name:    "cache",
+		startFn: func() error {
 			return nil
 		},
 		deps: []*Actor{net},
 	}
 
 	ui := &Actor{
-		name: "UI",
+		timeout: 200,
+		name:    "UI",
 		startFn: func() error {
-			log.Println("UI is running")
 			return nil
 		},
-		deps: []*Actor{db, net},
+		deps: []*Actor{db, cache},
 	}
 
-	_ = ui.Start(100)
+	if err := ui.Start(); err != nil {
+		log.Printf("failed to start root: %v", err)
+	}
 	log.Printf("ui status: %v", ui.status)
+	log.Printf("net status: %v", net.status)
+	log.Printf("db status: %v", db.status)
+	log.Printf("cache status: %v", cache.status)
 }
