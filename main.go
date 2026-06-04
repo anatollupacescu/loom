@@ -2,7 +2,9 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -136,6 +138,39 @@ func (a *Actor) start() error {
 	return nil
 }
 
+func (a *Actor) Validate() error {
+	return checkCycle(a, make(map[*Actor]bool), make(map[*Actor]bool), nil)
+}
+
+func checkCycle(a *Actor, inStack map[*Actor]bool, visited map[*Actor]bool, path []*Actor) error {
+	if inStack[a] {
+		// collect the names of actors involved in the cycle
+		names := make([]string, len(path))
+		for i, p := range path {
+			names[i] = p.name
+		}
+		names = append(names, a.name) // close the loop
+		return fmt.Errorf("cycle detected: %s", strings.Join(names, " -> "))
+	}
+
+	if visited[a] {
+		return nil
+	}
+
+	inStack[a] = true
+	visited[a] = true
+	path = append(path, a)
+
+	for _, dep := range a.deps {
+		if err := checkCycle(dep, inStack, visited, path); err != nil {
+			return err
+		}
+	}
+
+	inStack[a] = false
+	return nil
+}
+
 func main() {
 	net := &Actor{
 		timeout: 60,
@@ -153,6 +188,8 @@ func main() {
 		},
 		deps: []*Actor{net},
 	}
+
+	// net.deps = []*Actor{db}
 
 	cache := &Actor{
 		timeout: 100,
@@ -172,9 +209,15 @@ func main() {
 		deps: []*Actor{db, cache},
 	}
 
+	if err := ui.Validate(); err != nil {
+		log.Printf("validation error: %v", err)
+		return
+	}
+
 	if err := ui.Start(); err != nil {
 		log.Printf("failed to start root: %v", err)
 	}
+
 	log.Printf("ui status: %v", ui.status)
 	log.Printf("net status: %v", net.status)
 	log.Printf("db status: %v", db.status)
