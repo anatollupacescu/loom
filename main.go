@@ -12,7 +12,6 @@ import (
 
 const (
 	idle = iota
-	starting
 	running
 	stopping
 	stopped
@@ -26,8 +25,6 @@ func (s status) String() string {
 	switch s {
 	case idle:
 		return "idle"
-	case starting:
-		return "starting"
 	case running:
 		return "running"
 	case stopping:
