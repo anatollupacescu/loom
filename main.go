@@ -51,13 +51,41 @@ type Actor struct {
 	status status
 
 	startFn func() error
-	timeout int
+	timeout time.Duration // 0 means no timeout
 
 	deps []*Actor
 }
 
-type result struct {
-	err error
+func (a *Actor) Validate() error {
+	return checkCycle(a, make(map[*Actor]bool), make(map[*Actor]bool), nil)
+}
+
+func checkCycle(a *Actor, inStack map[*Actor]bool, visited map[*Actor]bool, path []*Actor) error {
+	if inStack[a] {
+		names := make([]string, len(path))
+		for i, p := range path {
+			names[i] = p.name
+		}
+		names = append(names, a.name)
+		return fmt.Errorf("cycle detected: %s", strings.Join(names, " -> "))
+	}
+
+	if visited[a] {
+		return nil
+	}
+
+	inStack[a] = true
+	path = append(path, a)
+
+	for _, dep := range a.deps {
+		if err := checkCycle(dep, inStack, visited, path); err != nil {
+			return err
+		}
+	}
+
+	inStack[a] = false
+	visited[a] = true // fully explored, safe to skip on future visits
+	return nil
 }
 
 func (a *Actor) Start() error {
@@ -70,16 +98,18 @@ func (a *Actor) Start() error {
 func (a *Actor) start() error {
 	// Start all dependencies concurrently
 	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		errs []error
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
 	)
 
 	for _, dep := range a.deps {
 		wg.Go(func() {
 			if err := dep.Start(); err != nil {
 				mu.Lock()
-				errs = append(errs, err)
+				if firstErr == nil {
+					firstErr = err
+				}
 				mu.Unlock()
 			}
 		})
@@ -87,113 +117,65 @@ func (a *Actor) start() error {
 
 	wg.Wait()
 
-	if len(errs) > 0 {
-		a.Lock()
+	if firstErr != nil {
 		a.status = dep_failed
-		a.Unlock()
-		return errs[0]
+		return firstErr
 	}
 
 	// Start self
-	var err error
 	if a.timeout == 0 {
-		err = a.startFn()
+		err := a.startFn()
 		if err != nil {
-			a.Lock()
 			a.status = failed
-			a.Unlock()
 			return err
 		}
-		a.Lock()
 		a.status = running
-		a.Unlock()
 		log.Printf("%s: started", a.name)
 		return nil
 	}
 
-	c := make(chan result, 1)
+	c := make(chan error, 1)
 	go func() {
-		c <- result{a.startFn()}
+		c <- a.startFn()
 	}()
 
 	select {
-	case res := <-c:
-		if res.err != nil {
-			a.Lock()
+	case err := <-c:
+		if err != nil {
 			a.status = failed
-			a.Unlock()
-			return res.err
+			return err
 		}
-	case <-time.After(time.Duration(a.timeout) * time.Millisecond):
-		a.Lock()
+	case <-time.After(a.timeout):
 		a.status = failed
-		a.Unlock()
 		return errors.New("timeout")
 	}
 
-	a.Lock()
 	a.status = running
-	a.Unlock()
 	log.Printf("%s: started", a.name)
-	return nil
-}
-
-func (a *Actor) Validate() error {
-	return checkCycle(a, make(map[*Actor]bool), make(map[*Actor]bool), nil)
-}
-
-func checkCycle(a *Actor, inStack map[*Actor]bool, visited map[*Actor]bool, path []*Actor) error {
-	if inStack[a] {
-		// collect the names of actors involved in the cycle
-		names := make([]string, len(path))
-		for i, p := range path {
-			names[i] = p.name
-		}
-		names = append(names, a.name) // close the loop
-		return fmt.Errorf("cycle detected: %s", strings.Join(names, " -> "))
-	}
-
-	if visited[a] {
-		return nil
-	}
-
-	inStack[a] = true
-	visited[a] = true
-	path = append(path, a)
-
-	for _, dep := range a.deps {
-		if err := checkCycle(dep, inStack, visited, path); err != nil {
-			return err
-		}
-	}
-
-	inStack[a] = false
 	return nil
 }
 
 func main() {
 	net := &Actor{
-		timeout: 60,
+		timeout: 60 * time.Millisecond,
 		name:    "network",
 		startFn: func() error {
-			return errors.New("network error")
+			return nil //errors.New("network error")
 		},
 	}
 
 	db := &Actor{
-		timeout: 100,
-		name:    "database",
+		timeout: 100 * time.Millisecond,
+		name:    "Database",
 		startFn: func() error {
 			return errors.New("port busy")
 		},
 		deps: []*Actor{net},
 	}
 
-	// net.deps = []*Actor{db}
-
 	cache := &Actor{
-		timeout: 100,
-		name:    "cache",
+		timeout: 100 * time.Millisecond,
+		name:    "Cache",
 		startFn: func() error {
 			return nil
 		},
@@ -201,7 +183,7 @@ func main() {
 	}
 
 	ui := &Actor{
-		timeout: 200,
+		timeout: 200 * time.Millisecond,
 		name:    "UI",
 		startFn: func() error {
 			return nil
