@@ -113,22 +113,36 @@ Returns the service's current `Status`. Reads the underlying `atomic.Int32` dire
 
 ### Start transitions
 
-```
-                    ┌─ one or more deps fail ──────────────► DepFailed
-Idle ──► (deps) ───┤
-                    └─ all deps Running ──► Starting ──► Running
-                                                     └──► Failed  (startFn returned error)
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Idle
+    Idle --> Starting : deps all Running
+    Idle --> DepFailed : one or more deps failed
+    Starting --> Running : startFn returned nil
+    Starting --> Failed : startFn returned error
+    note right of Starting
+        set before startFn is invoked
+    end note
+    note right of DepFailed
+        startFn is never called
+    end note
 ```
 
 The `Starting` state is set immediately before `startFn` is invoked, so a service's status is never ambiguously `Idle` while its start function is executing.
 
 ### Stop transitions
 
-```
-Running ──► Stopping ──► Stopped
-                     └──► Failed  (stopFn returned error)
-
-Any other state: no transition (stopFn is skipped; deps are still traversed)
+```mermaid
+stateDiagram-v2
+    direction LR
+    Running --> Stopping : Stop() called
+    Stopping --> Stopped : stopFn returned nil / no stopFn
+    Stopping --> Failed : stopFn returned error
+    note left of Running
+        any non-Running state: stopFn
+        skipped, deps still traversed
+    end note
 ```
 
 ---
